@@ -6,6 +6,9 @@
 //! | Govt | Treasury.gov daily curve (FRED fallback); Yahoo `^TNX` etc. intraday | Treasury.gov | — |
 //! | Equity/ETF | Alpaca if keyed, else Yahoo | Yahoo spark | — |
 //! | FX/Index/Comdty | Yahoo (`EURUSD=X`, `^GSPC`, `CL=F`) | Yahoo spark | — |
+//!
+//! Time and sales and streaming books: moomoo OpenD for US stocks and ETFs; Binance
+//! aggregate trades (Coinbase matches fallback) for crypto, whose book is polled.
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -13,26 +16,32 @@ use tr_core::{AssetClass, Bar, Security, Timeframe, catalog};
 
 use crate::alpaca::AlpacaProvider;
 use crate::crypto::CryptoProvider;
+use crate::moomoo::Moomoo;
 use crate::treasury::TreasuryProvider;
 use crate::yahoo::{YahooProvider, yahoo_symbol};
-use crate::{LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, YieldCurves, security};
+use crate::{
+    DepthFeed, LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, TapeFeed, YieldCurves,
+    security,
+};
 
 pub struct Markets {
     yahoo: YahooProvider,
     crypto: CryptoProvider,
     treasury: TreasuryProvider,
     alpaca: Option<AlpacaProvider>,
+    moomoo: Option<Moomoo>,
     name: String,
 }
 
 impl Markets {
-    pub fn new(alpaca: Option<AlpacaProvider>) -> Result<Self> {
+    pub fn new(alpaca: Option<AlpacaProvider>, moomoo: Option<Moomoo>) -> Result<Self> {
         let name = if alpaca.is_some() { "alpaca+yahoo+binance+ust" } else { "yahoo+binance+ust" }.to_string();
         Ok(Self {
             yahoo: YahooProvider::new()?,
             crypto: CryptoProvider::new()?,
             treasury: TreasuryProvider::new()?,
             alpaca,
+            moomoo,
             name,
         })
     }
@@ -112,6 +121,19 @@ impl MarketData for Markets {
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
         let sec = security(symbol);
         (sec.class == AssetClass::Crypto).then(|| CryptoProvider::live(&sec, tf))
+    }
+
+    fn tape(&self, symbol: &str) -> Option<TapeFeed> {
+        let sec = security(symbol);
+        match sec.class {
+            AssetClass::Crypto => Some(CryptoProvider::tape(&sec)),
+            _ => self.moomoo.as_ref()?.tape(symbol, &sec),
+        }
+    }
+
+    fn depth(&self, symbol: &str, depth: usize) -> Option<DepthFeed> {
+        let sec = security(symbol);
+        self.moomoo.as_ref()?.depth(symbol, &sec, depth)
     }
 
     async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {

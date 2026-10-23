@@ -26,7 +26,7 @@ mod markets {
 
     fn m() -> Markets {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        Markets::new(None).unwrap()
+        Markets::new(None, None).unwrap()
     }
 
     #[tokio::test]
@@ -105,5 +105,24 @@ mod markets {
         let spx = m.options("SPX Index", None).await.unwrap();
         assert!(spx.calls.len() > 20, "index options");
         assert!(m.options("BTCUSD Curncy", None).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn crypto_time_and_sales() {
+        let m = m();
+        let mut rx = m.tape("BTCUSD Curncy").unwrap();
+        let mut got = Vec::new();
+        while got.len() < 5 {
+            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await.unwrap().unwrap() {
+                tr_data::TapeEvent::Prints { prints, simulated, .. } => {
+                    assert!(!simulated);
+                    got.extend(prints);
+                }
+                tr_data::TapeEvent::Status(s) => eprintln!("status: {s}"),
+            }
+        }
+        assert!(got.iter().all(|p| p.price > 1_000.0 && p.size > 0.0 && p.side != tr_data::Aggressor::Unknown));
+        assert!(m.tape("EURUSD Curncy").is_none());
     }
 }

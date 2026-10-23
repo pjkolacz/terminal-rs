@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tr_core::{Bar, Timeframe, sample};
 
-use crate::{LiveFeed, MarketData, OptionChain, OrderBook, security};
+use crate::{Aggressor, LiveFeed, MarketData, OptionChain, OrderBook, Print, TapeEvent, TapeFeed, security};
 
 /// Deterministic synthetic data anchored at a fixed "now" per process, so paging is
 /// consistent: page N+1 is exactly the bars preceding page N. Levels and volatility
@@ -89,6 +89,46 @@ impl MarketData for SampleProvider {
                 bar.low = bar.low.min(px);
                 bar.volume += (rng.f64() * 100.0).round();
                 if tx.send(bar).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Some(rx)
+    }
+
+    /// Simulated prints around the latest sample price (offline mode only), flagged as such.
+    fn tape(&self, symbol: &str) -> Option<TapeFeed> {
+        if !self.live_ticks {
+            return None;
+        }
+        let mut px = self.bars(symbol, Timeframe::M1).last()?.close;
+        let sec = security(symbol);
+        let tick_vol = sec.class.sample_vol() * (0.4 / (365.0 * 86_400.0f64)).sqrt() * 4.0;
+        // Typical clip: ~$2,000 notional, so crypto prints are fractional and stocks whole shares.
+        let unit = 2_000.0 / px;
+        let whole = unit >= 1.0;
+        let (tx, rx) = mpsc::channel(64);
+        let mut rng = sample::Rng::new(sample::seed_for(symbol) ^ 0x7a9e);
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(Duration::from_millis(300));
+            loop {
+                iv.tick().await;
+                let now = chrono::Utc::now().timestamp_millis();
+                let n = 1 + (rng.f64() * 4.0) as usize;
+                let prints = (0..n)
+                    .map(|i| {
+                        px *= (tick_vol * rng.normal()).exp();
+                        let size = unit * (rng.normal() * 1.2).exp() * if rng.f64() < 0.03 { 40.0 } else { 1.0 };
+                        let side = match rng.f64() {
+                            x if x < 0.47 => Aggressor::Buy,
+                            x if x < 0.94 => Aggressor::Sell,
+                            _ => Aggressor::Unknown,
+                        };
+                        let size = if whole { size.round().max(1.0) } else { size };
+                        Print { ts_ms: now - (n - 1 - i) as i64 * 40, price: px, size, side, flag: None }
+                    })
+                    .collect();
+                if tx.send(TapeEvent::Prints { prints, source: "sample".into(), simulated: true }).await.is_err() {
                     break;
                 }
             }
@@ -227,5 +267,21 @@ mod tests {
         let b = rx.recv().await.unwrap();
         assert!(a.high >= a.low && b.ts >= a.ts && b.close > 0.0);
         assert!(SampleProvider::at(0, 10).live("X", Timeframe::M1).is_none());
+    }
+
+    #[tokio::test]
+    async fn simulated_tape() {
+        let p = SampleProvider::at(chrono::Utc::now().timestamp(), 100).with_live_ticks();
+        let Some(TapeEvent::Prints { prints, simulated, .. }) = p.tape("AAPL US Equity").unwrap().recv().await else {
+            panic!("expected prints");
+        };
+        assert!(simulated && !prints.is_empty());
+        assert!(prints.iter().all(|x| x.price > 0.0 && x.size >= 1.0 && x.size.fract() == 0.0));
+        assert!(prints.windows(2).all(|w| w[0].ts_ms <= w[1].ts_ms));
+        let Some(TapeEvent::Prints { prints, .. }) = p.tape("BTCUSD Curncy").unwrap().recv().await else {
+            panic!("expected prints");
+        };
+        assert!(prints.iter().all(|x| x.size < 1.0), "crypto clips are fractional");
+        assert!(SampleProvider::at(0, 10).tape("AAPL").is_none());
     }
 }

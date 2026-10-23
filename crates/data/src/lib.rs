@@ -8,6 +8,9 @@
 //!   REST/websocket (Coinbase as fallback) for crypto, Treasury.gov (FRED fallback) for US
 //!   Treasury yields, Yahoo Finance for FX, indices, futures, ETFs and stocks, or Alpaca for
 //!   US stocks/ETFs when `APCA_API_KEY_ID` + `APCA_API_SECRET_KEY` are set.
+//! - Streaming time and sales and order books ([`MarketData::tape`], [`MarketData::depth`])
+//!   come from moomoo OpenD for US stocks and ETFs (see [`moomoo`]) and from Binance (Coinbase
+//!   fallback) trades for crypto.
 //!
 //! The router is wrapped in [`Fallback`], which serves sample data if a source is
 //! unreachable, so the terminal always has something to draw.
@@ -16,6 +19,7 @@ pub mod alpaca;
 pub mod cache;
 pub mod crypto;
 pub mod markets;
+pub mod moomoo;
 pub mod rss;
 pub mod sample;
 pub mod treasury;
@@ -137,6 +141,58 @@ impl OrderBook {
     }
 }
 
+/// Which side started a trade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Aggressor {
+    /// A buyer lifted the offer.
+    Buy,
+    /// A seller hit the bid.
+    Sell,
+    /// Not reported (or a neutral print, e.g. a midpoint cross).
+    Unknown,
+}
+
+/// One time-and-sales print.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Print {
+    /// Trade time (Unix milliseconds).
+    pub ts_ms: i64,
+    pub price: f64,
+    pub size: f64,
+    pub side: Aggressor,
+    /// Short condition flag from the source (`EXT`, `ODD`, `OTC`…), if any.
+    pub flag: Option<String>,
+}
+
+impl Print {
+    pub fn notional(&self) -> f64 {
+        self.price * self.size
+    }
+}
+
+/// Updates from a time-and-sales stream.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TapeEvent {
+    /// New prints, oldest first.
+    Prints { prints: Vec<Print>, source: String, simulated: bool },
+    /// Connection state worth showing (connecting, source unavailable, retrying).
+    Status(String),
+}
+
+/// Updates from a streaming order book.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DepthEvent {
+    /// A full snapshot of the top levels.
+    Book(OrderBook),
+    Status(String),
+}
+
+/// Live prints for one symbol. The stream stops when the receiver is dropped.
+pub type TapeFeed = mpsc::Receiver<TapeEvent>;
+
+/// Live order book snapshots for one symbol. The stream stops when the receiver is dropped.
+pub type DepthFeed = mpsc::Receiver<DepthEvent>;
+
 /// One listed option.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptionContract {
@@ -254,6 +310,17 @@ pub trait MarketData: Send + Sync {
         anyhow::bail!("no public order book for {symbol}")
     }
 
+    /// Stream time and sales, if the source has a tape for this market.
+    fn tape(&self, _symbol: &str) -> Option<TapeFeed> {
+        None
+    }
+
+    /// Stream the top `depth` levels of the book, if the source pushes one. Markets without
+    /// a stream fall back to polling [`MarketData::order_book`].
+    fn depth(&self, _symbol: &str, _depth: usize) -> Option<DepthFeed> {
+        None
+    }
+
     /// The US Treasury curve. The default assembles it from each tenor's daily history.
     async fn yield_curves(&self) -> Result<YieldCurves> {
         let tenors = catalog::treasury_curve();
@@ -338,6 +405,15 @@ impl<P: MarketData> MarketData for Fallback<P> {
         self.primary.live(symbol, tf)
     }
 
+    // No synthetic tape: a pane without a real source says so instead.
+    fn tape(&self, symbol: &str) -> Option<TapeFeed> {
+        self.primary.tape(symbol)
+    }
+
+    fn depth(&self, symbol: &str, depth: usize) -> Option<DepthFeed> {
+        self.primary.depth(symbol, depth)
+    }
+
     async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
         self.primary.search(query).await
     }
@@ -398,7 +474,7 @@ pub fn from_env() -> Provider {
         }
         _ => None,
     };
-    match markets::Markets::new(alpaca) {
+    match markets::Markets::new(alpaca, moomoo::Moomoo::from_env()) {
         Ok(m) => Arc::new(Fallback::new(m)),
         Err(_) => Arc::new(sample::SampleProvider::default().with_live_ticks()),
     }

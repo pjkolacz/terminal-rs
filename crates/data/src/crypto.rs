@@ -1,6 +1,7 @@
 //! Crypto market data from free public endpoints: Binance spot REST and websocket kline
 //! streams (via the public market-data mirror, then the main API), with Coinbase Exchange
-//! REST candles and its websocket ticker channel as fallback.
+//! REST candles and its websocket ticker channel as fallback. Time and sales come from the
+//! Binance aggregate trade stream, falling back to Coinbase's `matches` channel.
 
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tr_core::{Bar, Security, Timeframe, catalog};
 
-use crate::{LiveFeed, Quote};
+use crate::{Aggressor, LiveFeed, Print, Quote, TapeEvent, TapeFeed};
 
 const BINANCE_REST: [&str; 2] = ["https://data-api.binance.vision", "https://api.binance.com"];
 const BINANCE_WS: [&str; 2] = ["wss://data-stream.binance.vision/ws", "wss://stream.binance.com:9443/ws"];
@@ -123,6 +124,42 @@ pub fn parse_coinbase_ws(text: &str) -> Option<(i64, f64, f64)> {
     }
     let ts = DateTime::parse_from_rfc3339(v["time"].as_str()?).ok()?.timestamp();
     Some((ts, num(&v["price"])?, num(&v["last_size"]).unwrap_or(0.0)))
+}
+
+/// Parse a Binance `aggTrade` event. `m` is set when the buyer was the maker, i.e. a
+/// seller crossed the spread.
+pub fn parse_binance_agg_trade(text: &str) -> Option<Print> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    if v["e"] != "aggTrade" {
+        return None;
+    }
+    Some(Print {
+        ts_ms: v["T"].as_i64()?,
+        price: num(&v["p"])?,
+        size: num(&v["q"])?,
+        side: if v["m"].as_bool()? { Aggressor::Sell } else { Aggressor::Buy },
+        flag: None,
+    })
+}
+
+/// Parse a Coinbase `match` (or `last_match`) message. `side` is the maker's order, so the
+/// aggressor is the other side.
+pub fn parse_coinbase_match(text: &str) -> Option<Print> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    if v["type"] != "match" && v["type"] != "last_match" {
+        return None;
+    }
+    Some(Print {
+        ts_ms: DateTime::parse_from_rfc3339(v["time"].as_str()?).ok()?.timestamp_millis(),
+        price: num(&v["price"])?,
+        size: num(&v["size"])?,
+        side: match v["side"].as_str()? {
+            "buy" => Aggressor::Sell,
+            "sell" => Aggressor::Buy,
+            _ => Aggressor::Unknown,
+        },
+        flag: None,
+    })
 }
 
 /// Coinbase granularity used to build `tf` bars, and whether resampling is needed.
@@ -384,6 +421,73 @@ impl CryptoProvider {
         });
         rx
     }
+
+    /// Live prints over websocket: Binance aggregate trades on either endpoint, then Coinbase
+    /// matches, reconnecting with backoff.
+    pub fn tape(sec: &Security) -> TapeFeed {
+        let (tx, rx) = mpsc::channel(256);
+        let stream = format!("{}@aggTrade", binance_symbol(sec).to_ascii_lowercase());
+        let product = coinbase_product(sec);
+        tokio::spawn(async move {
+            let mut backoff = 1;
+            let mut attempt = 0usize;
+            while !tx.is_closed() {
+                let res = match attempt % 3 {
+                    i @ (0 | 1) => {
+                        let url = format!("{}/{stream}", BINANCE_WS[i]);
+                        trades_ws(&url, None, parse_binance_agg_trade, "Binance", &tx).await
+                    }
+                    _ => {
+                        let sub = serde_json::json!({"type": "subscribe", "product_ids": [&product], "channels": ["matches"]});
+                        trades_ws(COINBASE_WS, Some(sub.to_string()), parse_coinbase_match, "Coinbase", &tx).await
+                    }
+                };
+                if tx.is_closed() {
+                    break;
+                }
+                if let Err(e) = res {
+                    tracing::debug!("tape {stream}: {e:#}");
+                    let msg = format!("Trade stream interrupted ({e:#}); reconnecting…");
+                    if tx.send(TapeEvent::Status(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                attempt += 1;
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(30);
+            }
+        });
+        rx
+    }
+}
+
+/// Forward every print `parse` finds on a trade websocket until it closes.
+async fn trades_ws(
+    url: &str,
+    subscribe: Option<String>,
+    parse: fn(&str) -> Option<Print>,
+    source: &str,
+    tx: &mpsc::Sender<TapeEvent>,
+) -> Result<()> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.with_context(|| format!("{source} websocket"))?;
+    if let Some(sub) = subscribe {
+        ws.send(Message::Text(sub.into())).await?;
+    }
+    while let Some(msg) = ws.next().await {
+        match msg? {
+            Message::Text(t) => {
+                if let Some(p) = parse(t.as_str()) {
+                    let ev = TapeEvent::Prints { prints: vec![p], source: source.into(), simulated: false };
+                    if tx.send(ev).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    bail!("{source} websocket closed")
 }
 
 async fn binance_ws(url: &str, tx: &mpsc::Sender<Bar>) -> Result<()> {
@@ -495,5 +599,17 @@ mod tests {
         assert_eq!(size, 0.0012);
         assert_eq!(ts, 1_791_777_838);
         assert!(parse_coinbase_ws("{\"type\":\"subscriptions\"}").is_none());
+    }
+
+    #[test]
+    fn trade_fixtures() {
+        // Buyer was the maker (`m`), so a seller crossed the spread.
+        let p = parse_binance_agg_trade(&fix("binance_ws_agg_trade.json")).unwrap();
+        assert_eq!((p.ts_ms, p.price, p.size, p.side), (1_792_720_308_292, 81_560.0, 0.00089, Aggressor::Sell));
+        assert!(parse_binance_agg_trade(&fix("binance_ws_kline.json")).is_none());
+        // Coinbase reports the maker's side: a resting sell was lifted by a buyer.
+        let p = parse_coinbase_match(&fix("coinbase_ws_match.json")).unwrap();
+        assert_eq!((p.ts_ms, p.price, p.size, p.side), (1_792_720_309_069, 81_441.68, 0.00349396, Aggressor::Buy));
+        assert!(parse_coinbase_match(&fix("coinbase_ws_ticker.json")).is_none());
     }
 }
