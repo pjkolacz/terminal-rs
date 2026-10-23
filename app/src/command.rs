@@ -250,6 +250,8 @@ pub enum Function {
     News,
     /// Order book depth (levels).
     OrderBook(Option<usize>),
+    /// Time and sales: live prints.
+    Tape,
     /// Option chain monitor (Bloomberg OMON).
     Options,
     /// `SIDEBAR LEFT|RIGHT|TOGGLE|SHOW|HIDE|SWAP`.
@@ -336,6 +338,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         }),
         "N" | "CN" | "NEWS" | "TOP" => Function::News,
         "OB" | "BOOK" | "DEPTH" | "DOM" => Function::OrderBook(num(rest.first())),
+        "TAS" | "T&S" | "TAPE" | "QR" => Function::Tape,
         "OMON" | "OMST" | "OPT" | "OPTIONS" | "CHAIN" => Function::Options,
         "SIDEBAR" | "SB" => Function::Sidebar(words().join(" ")),
         "PREFS" | "SETTINGS" | "PDF" | "CONFIG" => Function::Settings,
@@ -481,6 +484,7 @@ fn describe(f: &Function) -> String {
         Function::Link(None) => "Unlink focused pane".into(),
         Function::News => "News headlines".into(),
         Function::OrderBook(_) => "Order book (depth)".into(),
+        Function::Tape => "Time and sales: live prints by aggressor".into(),
         Function::Options => "Option chain: calls and puts by strike, IV and greeks".into(),
         Function::Sidebar(s) if s.is_empty() => "Toggle the sidebar".into(),
         Function::Sidebar(s) => format!("Sidebar {}", s.to_lowercase()),
@@ -618,6 +622,9 @@ mod tests {
         assert_eq!(parse("PREFS"), Some(Command::Function(Function::Settings)));
         assert_eq!(parse("update"), Some(Command::Function(Function::Update)));
         assert_eq!(parse("AAPL OMON"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Options)));
+        assert_eq!(parse("AAPL TAS"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Tape)));
+        assert_eq!(parse("BTCUSD CRNCY T&S"), Some(Command::SymbolFunction("BTCUSD Curncy".into(), Function::Tape)));
+        assert_eq!(parse("TAPE"), Some(Command::Function(Function::Tape)));
         assert_eq!(parse("SPX INDEX OMON"), Some(Command::SymbolFunction("SPX Index".into(), Function::Options)));
         assert_eq!(parse("OMON"), Some(Command::Function(Function::Options)));
         assert_eq!(parse("SIDEBAR RIGHT"), Some(Command::Function(Function::Sidebar("RIGHT".into()))));

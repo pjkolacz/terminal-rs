@@ -16,7 +16,7 @@ use tr_congress::refresh::{self, HttpSource, NewTradeAlert, RefreshConfig};
 use tr_congress::{Db, Politician, Trade};
 use tr_core::indicators::registry::{Input, Plot, Tone};
 use tr_core::{Bar, Security, Series, Timeframe};
-use tr_data::{BarCache, Provider, Quote, SearchHit, YieldCurves};
+use tr_data::{BarCache, DepthEvent, DepthFeed, Print, Provider, Quote, SearchHit, TapeEvent, TapeFeed, YieldCurves};
 
 use crate::command::IndicatorSpec;
 use crate::theme;
@@ -57,6 +57,17 @@ pub enum Request {
         symbol: Option<String>,
     },
     OrderBook {
+        pane: PaneId,
+        symbol: String,
+        depth: usize,
+    },
+    /// Stream time and sales into `pane` (replacing any stream it had).
+    Tape {
+        pane: PaneId,
+        symbol: String,
+    },
+    /// Stream the book into `pane` where the source pushes one; the pane polls otherwise.
+    Depth {
         pane: PaneId,
         symbol: String,
         depth: usize,
@@ -117,7 +128,7 @@ pub enum Request {
     Alerts,
     MarkAlertsSeen,
     RefreshCongress,
-    /// A pane closed or changed: stop its live feed and drop its series.
+    /// A pane closed or changed: stop its live feeds and streams and drop its series.
     Forget(PaneId),
     YieldCurves,
     Search(String),
@@ -218,6 +229,22 @@ pub enum Response {
         pane: PaneId,
         symbol: String,
         book: Result<tr_data::OrderBook, String>,
+        /// Pushed by a stream rather than polled.
+        live: bool,
+    },
+    /// New prints for a time-and-sales pane, oldest first.
+    Tape {
+        pane: PaneId,
+        symbol: String,
+        prints: Vec<Print>,
+        source: String,
+        simulated: bool,
+    },
+    /// Connection state of a pane's stream (connecting, unavailable, retrying).
+    StreamStatus {
+        pane: PaneId,
+        symbol: String,
+        status: String,
     },
     History {
         pane: PaneId,
@@ -293,6 +320,9 @@ struct Shared {
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
     series: std::sync::Mutex<SeriesMap>,
+    /// The tape or depth stream feeding each pane; aborting it drops the feed, which closes
+    /// the source's connection.
+    streams: std::sync::Mutex<HashMap<PaneId, tokio::task::AbortHandle>>,
     cache: std::sync::Mutex<Option<BarCache>>,
     db: Mutex<Db>,
     out: mpsc::Sender<Response>,
@@ -341,18 +371,23 @@ impl Worker {
         let shared = Arc::new(Shared {
             provider,
             series: Default::default(),
+            streams: Default::default(),
             cache: std::sync::Mutex::new(cache),
             db: Mutex::new(db),
             out,
             ctx,
         });
 
-        // Request dispatcher: every request runs as its own task.
+        // Request dispatcher: every request runs as its own task, except stream setup and
+        // teardown, which run in order so a quick change or close can't be overtaken by the
+        // request it replaces.
         let s = shared.clone();
         rt.spawn(async move {
             while let Some(req) = req_rx.recv().await {
-                let s = s.clone();
-                tokio::spawn(async move { handle(&s, req).await });
+                if let Some(req) = streams(&s, req) {
+                    let s = s.clone();
+                    tokio::spawn(async move { handle(&s, req).await });
+                }
             }
         });
 
@@ -640,8 +675,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::Alerts(db.alerts(false, 200).unwrap_or_default()));
         }
         Request::RefreshCongress => congress_refresh(s).await,
-        Request::Forget(pane) => {
-            s.series.lock().expect("series lock").remove(&pane);
+        // Taken by the dispatcher; kept here so every request has one handler.
+        r @ (Request::Forget(_) | Request::Tape { .. } | Request::Depth { .. }) => {
+            streams(s, r);
         }
         Request::YieldCurves => match s.provider.yield_curves().await {
             Ok(c) => s.send(Response::Curves(Box::new(c))),
@@ -688,7 +724,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         }
         Request::OrderBook { pane, symbol, depth } => {
             let book = s.provider.order_book(&symbol, depth).await.map_err(|e| format!("{e:#}"));
-            s.send(Response::OrderBook { pane, symbol, book });
+            s.send(Response::OrderBook { pane, symbol, book, live: false });
         }
         Request::Search(query) => {
             let hits = s.provider.search(&query).await.unwrap_or_default();
@@ -765,6 +801,107 @@ fn store_series(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) 
 
 fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<Bar>>> {
     s.series.lock().expect("series lock").get(&pane).filter(|(g, _)| *g == generation).map(|(_, b)| b.clone())
+}
+
+/// Start, replace or stop pane streams (and drop a forgotten pane's series). Returns any
+/// other request untouched.
+fn streams(s: &Arc<Shared>, req: Request) -> Option<Request> {
+    match req {
+        Request::Forget(pane) => {
+            s.series.lock().expect("series lock").remove(&pane);
+            set_stream(s, pane, None);
+        }
+        Request::Tape { pane, symbol } => match s.provider.tape(&symbol) {
+            Some(feed) => {
+                let h = tokio::spawn(forward_tape(s.clone(), pane, symbol, feed)).abort_handle();
+                set_stream(s, pane, Some(h));
+            }
+            None => {
+                set_stream(s, pane, None);
+                let key = tr_data::security(&symbol).key();
+                let status = format!(
+                    "No time and sales source for {key}. Prints stream for US stocks and ETFs through moomoo OpenD, and for crypto."
+                );
+                s.send(Response::StreamStatus { pane, symbol, status });
+            }
+        },
+        Request::Depth { pane, symbol, depth } => {
+            let h = s
+                .provider
+                .depth(&symbol, depth)
+                .map(|feed| tokio::spawn(forward_depth(s.clone(), pane, symbol, feed)).abort_handle());
+            set_stream(s, pane, h);
+        }
+        other => return Some(other),
+    }
+    None
+}
+
+/// Make `h` the pane's stream, stopping the one it replaces.
+fn set_stream(s: &Shared, pane: PaneId, h: Option<tokio::task::AbortHandle>) {
+    let mut streams = s.streams.lock().expect("streams lock");
+    let old = match h {
+        Some(h) => streams.insert(pane, h),
+        None => streams.remove(&pane),
+    };
+    if let Some(old) = old {
+        old.abort();
+    }
+}
+
+/// How often streamed prints and books reach the UI.
+const STREAM_PUBLISH: Duration = Duration::from_millis(100);
+
+/// A publish timer that, after sitting idle, fires once and then paces again (rather than
+/// bursting through the ticks it missed).
+fn publish_timer() -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(STREAM_PUBLISH);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick
+}
+
+/// Batch a tape's prints into at most ten UI updates a second.
+async fn forward_tape(s: Arc<Shared>, pane: PaneId, symbol: String, mut feed: TapeFeed) {
+    let mut tick = publish_timer();
+    let mut batch: Vec<Print> = Vec::new();
+    let (mut source, mut simulated) = (String::new(), false);
+    loop {
+        tokio::select! {
+            ev = feed.recv() => match ev {
+                Some(TapeEvent::Prints { prints, source: src, simulated: sim }) => {
+                    batch.extend(prints);
+                    (source, simulated) = (src, sim);
+                }
+                Some(TapeEvent::Status(status)) => s.send(Response::StreamStatus { pane, symbol: symbol.clone(), status }),
+                None => break,
+            },
+            _ = tick.tick(), if !batch.is_empty() => {
+                let prints = std::mem::take(&mut batch);
+                s.send(Response::Tape { pane, symbol: symbol.clone(), prints, source: source.clone(), simulated });
+            }
+        }
+    }
+    tracing::debug!("tape for pane {pane} ({symbol}) stopped");
+}
+
+/// Forward the newest book at most ten times a second.
+async fn forward_depth(s: Arc<Shared>, pane: PaneId, symbol: String, mut feed: DepthFeed) {
+    let mut tick = publish_timer();
+    let mut latest = None;
+    loop {
+        tokio::select! {
+            ev = feed.recv() => match ev {
+                Some(DepthEvent::Book(b)) => latest = Some(b),
+                Some(DepthEvent::Status(status)) => s.send(Response::StreamStatus { pane, symbol: symbol.clone(), status }),
+                None => break,
+            },
+            _ = tick.tick(), if latest.is_some() => {
+                let book = Ok(latest.take().expect("checked"));
+                s.send(Response::OrderBook { pane, symbol: symbol.clone(), book, live: true });
+            }
+        }
+    }
+    tracing::debug!("depth for pane {pane} ({symbol}) stopped");
 }
 
 /// Merge the provider's live feed (if any) into the pane's series, publishing at most
@@ -921,6 +1058,7 @@ mod tests {
         let s = Shared {
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             series: Default::default(),
+            streams: Default::default(),
             cache: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             out,
@@ -933,6 +1071,56 @@ mod tests {
         assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(0, 1.0, 1.0, 1.0, 1.0, 1.0)])));
         assert_eq!(current_series(&s, 1, 2).unwrap().len(), 1);
         assert!(current_series(&s, 1, 1).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streams_replace_and_stop_in_order() {
+        let (out, rx) = mpsc::channel();
+        let now = chrono::Utc::now().timestamp();
+        let s = Arc::new(Shared {
+            provider: Arc::new(tr_data::sample::SampleProvider::at(now, 100).with_live_ticks()),
+            series: Default::default(),
+            streams: Default::default(),
+            cache: std::sync::Mutex::new(None),
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            out,
+            ctx: egui::Context::default(),
+        });
+        let stream = |s: &Shared| s.streams.lock().unwrap().get(&1).cloned();
+        let stopped = |h: tokio::task::AbortHandle| async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !h.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok()
+        };
+        assert!(streams(&s, Request::Tape { pane: 1, symbol: "AAPL US Equity".into() }).is_none());
+        let first = stream(&s).expect("tape stream");
+        // A new symbol replaces the stream; the old one stops and only the new one publishes.
+        streams(&s, Request::Tape { pane: 1, symbol: "MSFT US Equity".into() });
+        let second = stream(&s).expect("replacement stream");
+        let rx = tokio::task::spawn_blocking(move || {
+            loop {
+                if let Response::Tape { pane, symbol, prints, simulated, .. } =
+                    rx.recv_timeout(Duration::from_secs(5)).unwrap()
+                    && symbol == "MSFT US Equity"
+                {
+                    assert!(pane == 1 && simulated && !prints.is_empty());
+                    return rx;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(stopped(first).await, "replaced stream stopped");
+        // Forgetting the pane stops its stream; other requests pass through untouched.
+        streams(&s, Request::Forget(1));
+        assert!(stream(&s).is_none());
+        assert!(stopped(second).await, "forgotten pane's stream stopped");
+        assert!(streams(&s, Request::Alerts).is_some());
+        drop(rx);
     }
 
     #[test]

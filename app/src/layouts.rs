@@ -91,6 +91,13 @@ pub enum PaneSettings {
         #[serde(default)]
         group: f64,
     },
+    /// Time and sales.
+    Tape {
+        symbol: String,
+        /// Smallest trade value shown; 0 = every print.
+        #[serde(default)]
+        min_notional: f64,
+    },
     Settings,
     /// Option chain monitor.
     Options {
@@ -465,8 +472,16 @@ mod tests {
             title: None,
             window: None,
         });
+        doc.panes.push(SavedPane {
+            id: 8,
+            settings: PaneSettings::Tape { symbol: "AAPL US Equity".into(), min_notional: 100_000.0 },
+            link: Some(Link::Blue),
+            title: None,
+            window: None,
+        });
         doc.dock.insert(1, Zone::Right, 5);
         doc.dock.insert(5, Zone::Center, 7);
+        doc.dock.insert(5, Zone::Bottom, 8);
         doc.panes[0].link = Some(Link::Blue);
         doc.focus = Some(5);
         doc.sidebar_side = Some(crate::prefs::SidebarSide::Right);
@@ -480,6 +495,7 @@ mod tests {
         let json = doc.to_json();
         let text = String::from_utf8(json.clone()).unwrap();
         assert!(text.contains("\"OrderBook\"") && text.contains("\"link\": \"Blue\""));
+        assert!(text.contains("\"Tape\"") && text.contains("\"min_notional\": 100000.0"));
         let back = LayoutDoc::from_json(&json).unwrap();
         assert_eq!(back, doc);
         // Popped-out panes stay out of the dock.

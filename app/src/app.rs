@@ -13,13 +13,14 @@ mod palette_view;
 mod panels;
 mod portfolio_view;
 mod settings_view;
+mod tape_view;
 mod theming;
 mod trading;
 mod workspace;
 
 pub use broker::PosSort;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Event, Key, Modifiers, Rect, Ui, UiBuilder, pos2, vec2};
@@ -27,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tr_chart::drawings::Tool;
 use tr_congress::Trade;
 use tr_congress::db::{Alert, PoliticianSummary};
-use tr_data::{NewsItem, OrderBook, Quote, SearchHit, YieldCurves};
+use tr_data::{Aggressor, NewsItem, OrderBook, Print, Quote, SearchHit, YieldCurves};
 
 use crate::anim;
 use crate::chart_view::ChartState;
@@ -70,6 +71,8 @@ pub enum PaneKind {
     },
     News(Box<NewsPane>),
     OrderBook(Box<BookPane>),
+    /// Time and sales (`TAS`).
+    Tape(Box<TapePane>),
     Options(Box<OptionsPane>),
     /// Brokerage accounts through SnapTrade (`PORT`, `ACCT`, `POS`, `ORD`, `ACTV`).
     Portfolio(Box<broker::PortfolioPane>),
@@ -154,11 +157,88 @@ pub struct BookPane {
     pub book: Option<OrderBook>,
     pub error: Option<String>,
     pub fetched: Option<Instant>,
+    /// The (symbol, depth) a stream was requested for.
+    pub streaming: Option<(String, usize)>,
+    /// When the stream last pushed a book; polling stands in while it is quiet.
+    pub live_at: Option<Instant>,
+    /// The stream's connection state, while it is not delivering.
+    pub status: Option<String>,
 }
 
 impl BookPane {
     pub fn new(symbol: &str, depth: usize, group: f64) -> Self {
-        Self { symbol: symbol.into(), depth, group, book: None, error: None, fetched: None }
+        Self {
+            symbol: symbol.into(),
+            depth,
+            group,
+            book: None,
+            error: None,
+            fetched: None,
+            streaming: None,
+            live_at: None,
+            status: None,
+        }
+    }
+
+    /// The stream pushed a book recently.
+    pub fn is_live(&self) -> bool {
+        self.live_at.is_some_and(|t| t.elapsed() < Duration::from_secs(3))
+    }
+}
+
+/// Prints kept per time-and-sales pane.
+pub const TAPE_CAP: usize = 5_000;
+
+pub struct TapePane {
+    pub symbol: String,
+    /// Newest first.
+    pub prints: VecDeque<Print>,
+    /// Smallest trade value shown (0 = every print).
+    pub min_notional: f64,
+    /// Source name and whether it is simulated, once prints arrive.
+    pub source: Option<(String, bool)>,
+    /// The stream's connection state.
+    pub status: Option<String>,
+    pub requested: bool,
+    pub last_print: Option<Instant>,
+    /// Volume by aggressor since the pane opened.
+    pub buy_volume: f64,
+    pub sell_volume: f64,
+    pub volume: f64,
+    pub count: u64,
+}
+
+impl TapePane {
+    pub fn new(symbol: &str, min_notional: f64) -> Self {
+        Self {
+            symbol: symbol.into(),
+            prints: VecDeque::new(),
+            min_notional,
+            source: None,
+            status: None,
+            requested: false,
+            last_print: None,
+            buy_volume: 0.0,
+            sell_volume: 0.0,
+            volume: 0.0,
+            count: 0,
+        }
+    }
+
+    /// Add prints (oldest first), keeping the newest [`TAPE_CAP`].
+    pub fn push(&mut self, prints: Vec<Print>) {
+        for p in prints {
+            match p.side {
+                Aggressor::Buy => self.buy_volume += p.size,
+                Aggressor::Sell => self.sell_volume += p.size,
+                Aggressor::Unknown => {}
+            }
+            self.volume += p.size;
+            self.count += 1;
+            self.prints.push_front(p);
+        }
+        self.prints.truncate(TAPE_CAP);
+        self.last_print = Some(Instant::now());
     }
 }
 
@@ -186,6 +266,7 @@ impl PaneKind {
                 None => "Top News".into(),
             },
             PaneKind::OrderBook(b) => format!("{} Depth", short(&b.symbol)),
+            PaneKind::Tape(t) => format!("{} T&S", short(&t.symbol)),
             PaneKind::Options(o) => format!("{} Options", short(&o.symbol)),
             PaneKind::Portfolio(p) => p.title(),
             PaneKind::Settings => "Settings".into(),
@@ -206,6 +287,7 @@ impl PaneKind {
             PaneKind::Search { .. } => "SECF",
             PaneKind::News(_) => "CN",
             PaneKind::OrderBook(_) => "OB",
+            PaneKind::Tape(_) => "TAS",
             PaneKind::Options(_) => "OMON",
             PaneKind::Portfolio(p) => p.view.code(),
             PaneKind::Settings => "PDF",
@@ -219,6 +301,7 @@ impl PaneKind {
             PaneKind::Ticker { symbol, .. } => Some(symbol),
             PaneKind::News(n) => n.symbol.as_deref(),
             PaneKind::OrderBook(b) => Some(&b.symbol),
+            PaneKind::Tape(t) => Some(&t.symbol),
             PaneKind::Options(o) => Some(&o.symbol),
             _ => None,
         }
@@ -231,6 +314,7 @@ impl PaneKind {
                 | PaneKind::Ticker { .. }
                 | PaneKind::News(_)
                 | PaneKind::OrderBook(_)
+                | PaneKind::Tape(_)
                 | PaneKind::Options(_)
         )
     }
@@ -265,6 +349,7 @@ impl PaneKind {
             PaneKind::OrderBook(b) => {
                 PaneSettings::OrderBook { symbol: b.symbol.clone(), depth: b.depth, group: b.group }
             }
+            PaneKind::Tape(t) => PaneSettings::Tape { symbol: t.symbol.clone(), min_notional: t.min_notional },
             PaneKind::Settings => PaneSettings::Settings,
             PaneKind::Options(o) => {
                 PaneSettings::Options { symbol: o.symbol.clone(), strikes: o.strikes, greeks: o.show_greeks }
@@ -317,6 +402,9 @@ impl PaneKind {
             PaneSettings::News(s) => PaneKind::News(Box::new(NewsPane::new(s))),
             PaneSettings::OrderBook { symbol, depth, group } => {
                 PaneKind::OrderBook(Box::new(BookPane::new(&symbol, depth, group)))
+            }
+            PaneSettings::Tape { symbol, min_notional } => {
+                PaneKind::Tape(Box::new(TapePane::new(&symbol, min_notional)))
             }
             PaneSettings::Settings => PaneKind::Settings,
             PaneSettings::Options { symbol, strikes, greeks } => {
@@ -761,6 +849,10 @@ impl TerminalApp {
                 self.open_panel(PaneKind::OrderBook(Box::new(BookPane::new(&s, depth, 0.0))));
                 self.status = format!("{s}: order book");
             }
+            Command::SymbolFunction(s, Function::Tape) => {
+                self.open_panel(PaneKind::Tape(Box::new(TapePane::new(&s, 0.0))));
+                self.status = format!("{s}: time and sales");
+            }
             Command::SymbolFunction(s, Function::Options) => {
                 self.open_panel(PaneKind::Options(Box::new(OptionsPane::new(&s, 12, true))));
                 self.status = format!("{s}: option chain");
@@ -858,6 +950,10 @@ impl TerminalApp {
                 let sym = self.focused_symbol().unwrap_or_else(|| "BTCUSD Curncy".into());
                 let depth = depth.unwrap_or(self.prefs.panels.book_depth).clamp(5, 200);
                 self.open_panel(PaneKind::OrderBook(Box::new(BookPane::new(&sym, depth, 0.0))));
+            }
+            Function::Tape => {
+                let sym = self.focused_symbol().unwrap_or_else(|| "BTCUSD Curncy".into());
+                self.open_panel(PaneKind::Tape(Box::new(TapePane::new(&sym, 0.0))));
             }
             Function::Settings => self.open_panel(PaneKind::Settings),
             Function::Update => {
@@ -1040,10 +1136,12 @@ impl TerminalApp {
                         }
                     }
                 }
-                Response::OrderBook { pane, symbol, book } => {
+                Response::OrderBook { pane, symbol, book, live } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
                         && let PaneKind::OrderBook(b) = &mut p.kind
                         && b.symbol == symbol
+                        // A poll answered after the stream took over is older than its books.
+                        && (live || !b.is_live())
                     {
                         match book {
                             Ok(book) => {
@@ -1051,6 +1149,29 @@ impl TerminalApp {
                                 b.error = None;
                             }
                             Err(e) => b.error = Some(e),
+                        }
+                        if live {
+                            b.live_at = Some(Instant::now());
+                            b.status = None;
+                        }
+                    }
+                }
+                Response::Tape { pane, symbol, prints, source, simulated } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::Tape(t) = &mut p.kind
+                        && t.symbol == symbol
+                    {
+                        t.push(prints);
+                        t.source = Some((source, simulated));
+                        t.status = None;
+                    }
+                }
+                Response::StreamStatus { pane, symbol, status } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane) {
+                        match &mut p.kind {
+                            PaneKind::Tape(t) if t.symbol == symbol => t.status = Some(status),
+                            PaneKind::OrderBook(b) if b.symbol == symbol => b.status = Some(status),
+                            _ => {}
                         }
                     }
                 }
@@ -1349,7 +1470,17 @@ impl TerminalApp {
             self.worker.send(Request::YieldCurves);
             self.last_curve = Some(Instant::now());
         }
-        // News every 5 minutes and order books every second, while visible.
+        // Tapes stream from the moment they open, visible or not, so the record is unbroken.
+        for p in &mut self.panes {
+            if let PaneKind::Tape(t) = &mut p.kind
+                && !t.requested
+            {
+                t.requested = true;
+                self.worker.send(Request::Tape { pane: p.id, symbol: t.symbol.clone() });
+            }
+        }
+        // News every 5 minutes; order books stream where the source pushes them and are
+        // polled every second (while visible) whenever the stream is quiet.
         for &i in &visible {
             let p = &mut self.panes[i];
             match &mut p.kind {
@@ -1365,9 +1496,16 @@ impl TerminalApp {
                         expiration: o.expiration,
                     });
                 }
-                PaneKind::OrderBook(b) if b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) => {
-                    b.fetched = Some(Instant::now());
-                    self.worker.send(Request::OrderBook { pane: p.id, symbol: b.symbol.clone(), depth: b.depth });
+                PaneKind::OrderBook(b) => {
+                    let key = (b.symbol.clone(), b.depth);
+                    if b.streaming.as_ref() != Some(&key) {
+                        self.worker.send(Request::Depth { pane: p.id, symbol: key.0.clone(), depth: key.1 });
+                        b.streaming = Some(key);
+                    }
+                    if !b.is_live() && b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) {
+                        b.fetched = Some(Instant::now());
+                        self.worker.send(Request::OrderBook { pane: p.id, symbol: b.symbol.clone(), depth: b.depth });
+                    }
                 }
                 _ => {}
             }
@@ -1610,6 +1748,7 @@ mod tests {
             PaneSettings::News(Some("AAPL US Equity".into())),
             PaneSettings::News(None),
             PaneSettings::OrderBook { symbol: "ETHUSD Curncy".into(), depth: 50, group: 1.0 },
+            PaneSettings::Tape { symbol: "AAPL US Equity".into(), min_notional: 10_000.0 },
             PaneSettings::Search("gold".into()),
             PaneSettings::Settings,
             PaneSettings::Wei,

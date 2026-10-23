@@ -481,6 +481,11 @@ impl TerminalApp {
                     **b = BookPane::new(&key, b.depth, 0.0);
                 }
             }
+            PaneKind::Tape(t) => {
+                if t.symbol != key {
+                    **t = super::TapePane::new(&key, t.min_notional);
+                }
+            }
             PaneKind::Options(o) => {
                 if o.symbol != key {
                     **o = super::OptionsPane::new(&key, o.strikes, o.show_greeks);
@@ -675,6 +680,11 @@ impl TerminalApp {
                     .or(current.filter(|s| tr_data::security(s).class == tr_core::AssetClass::Crypto))
                     .unwrap_or_else(|| "BTCUSD Curncy".into());
                 PaneKind::OrderBook(Box::new(BookPane::new(&sym, d.book_depth, 0.0)))
+            }
+            "TAS" | "T&S" | "TAPE" | "QR" => {
+                // Default to a market with a free tape.
+                let sym = given.or(current).unwrap_or_else(|| "BTCUSD Curncy".into());
+                PaneKind::Tape(Box::new(super::TapePane::new(&sym, 0.0)))
             }
             "OMON" | "OPT" | "OPTIONS" | "CHAIN" => {
                 let sym = given.unwrap_or_else(|| self.optionable_symbol());

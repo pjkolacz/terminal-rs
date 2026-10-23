@@ -250,6 +250,7 @@ pub enum Action {
     NewWatchlist,
     NewNews,
     NewOrderBook,
+    NewTape,
     NewWorldMarkets,
     NewYieldCurve,
     NewCongress,
@@ -276,7 +277,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 52] = [
+    pub const ALL: [Action; 53] = [
         Action::Help,
         Action::Congress,
         Action::Politicians,
@@ -306,6 +307,7 @@ impl Action {
         Action::NewWatchlist,
         Action::NewNews,
         Action::NewOrderBook,
+        Action::NewTape,
         Action::NewWorldMarkets,
         Action::NewYieldCurve,
         Action::NewCongress,
@@ -362,6 +364,7 @@ impl Action {
             Action::NewWatchlist => "New Watchlist pane".into(),
             Action::NewNews => "New News pane".into(),
             Action::NewOrderBook => "New Order book pane".into(),
+            Action::NewTape => "New Time and sales pane".into(),
             Action::NewWorldMarkets => "New World markets pane".into(),
             Action::NewYieldCurve => "New Yield curve pane".into(),
             Action::NewCongress => "New Congress feed pane".into(),
@@ -421,6 +424,7 @@ impl Action {
             Action::NewWatchlist => "WL",
             Action::NewNews => "NEWS",
             Action::NewOrderBook => "BOOK",
+            Action::NewTape => "TAS",
             Action::NewWorldMarkets => "WEI",
             Action::NewYieldCurve => "GC",
             Action::NewCongress => "CONG",
@@ -606,9 +610,11 @@ impl Default for Keymap {
         bind(Action::Magnet, "Alt+M");
         // ⌘1…⌘9, ⌘0 open panels; ⌥1…⌥9 switch saved layouts.
         bind(Action::NewOptions, "Cmd+Shift+O");
+        bind(Action::NewTape, "Cmd+Shift+T");
         bind(Action::SwapSidebarSide, "Cmd+Alt+S");
         bind(Action::NextTheme, "Cmd+Alt+T");
-        for (i, a) in Action::ALL.iter().filter(|a| a.panel_spec().is_some() && **a != Action::NewOptions).enumerate() {
+        let own_chord = [Action::NewOptions, Action::NewTape];
+        for (i, a) in Action::ALL.iter().filter(|a| a.panel_spec().is_some() && !own_chord.contains(a)).enumerate() {
             bind(*a, &format!("Cmd+{}", (i + 1) % 10));
         }
         for (i, a) in Action::ALL.iter().filter(|a| a.layout_slot().is_some()).enumerate() {

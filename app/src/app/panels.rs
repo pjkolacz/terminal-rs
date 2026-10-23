@@ -80,6 +80,11 @@ impl TerminalApp {
                     actions.push(a);
                 }
             }
+            PaneKind::Tape(t) => {
+                if let Some(a) = super::tape_view::tape(ui, t) {
+                    actions.push(a);
+                }
+            }
             PaneKind::Portfolio(pp) => {
                 let demo =
                     (self.prefs.trading.account_mode == crate::prefs::AccountMode::Demo).then_some(&*self.demo.pf);
@@ -321,6 +326,9 @@ fn fmt_size(q: f64) -> String {
         format!("{:.2}M", q / 1e6)
     } else if q >= 1e3 {
         format!("{:.2}K", q / 1e3)
+    } else if q.fract() == 0.0 {
+        // Whole shares (stock books) need no decimals.
+        format!("{q:.0}")
     } else if q >= 1.0 {
         format!("{q:.3}")
     } else {
@@ -345,10 +353,18 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
                 ui.label(
                     RichText::new(" SIMULATED ").font(ui_font(10.5)).color(Color32::BLACK).background_color(amber()),
                 )
-                .on_hover_text("No free public order book for this market (or offline); levels are synthetic.");
+                .on_hover_text(
+                    "No live book for this market (or offline); levels are synthetic. US stocks stream through moomoo OpenD.",
+                );
+            } else if b.is_live() {
+                ui.label(RichText::new("● LIVE").font(ui_font(10.5)).color(theme::up()))
+                    .on_hover_text("Streaming: the book updates as the source pushes it.");
             }
         }
     });
+    if let Some(s) = b.status.as_ref().filter(|_| !b.is_live()) {
+        ui.label(RichText::new(s).font(ui_font(11.5)).color(muted()));
+    }
     ui.horizontal_wrapped(|ui| {
         let depths = [10usize, 20, 50];
         let dl = ["10", "20", "50"];
@@ -457,5 +473,7 @@ mod tests {
         assert!((fx[1] - 1e-4).abs() < 1e-12);
         assert_eq!(fmt_size(1_500.0), "1.50K");
         assert_eq!(fmt_size(0.5), "0.50000");
+        assert_eq!(fmt_size(420.0), "420");
+        assert_eq!(fmt_size(2.5), "2.500");
     }
 }

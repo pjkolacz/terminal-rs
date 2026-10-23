@@ -74,8 +74,16 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
 - **Markets** — `WEI` world markets (Americas/EMEA/Asia-Pacific indices, futures, Treasuries, FX,
   crypto and commodities with sparklines), `GC` US Treasury yield curve (now vs 1M and 1Y ago,
   2s10s / 3m10y / 5s30s), **news** (`AAPL CN`; Yahoo headlines, CoinDesk for crypto) and
-  **order book** depth (`BTCUSD CRNCY OB`; live Binance book, Coinbase fallback; markets without a
-  free public book show a clearly marked simulation).
+  **order book** depth (`BTCUSD CRNCY OB`; live Binance book, Coinbase fallback; US stocks and ETFs
+  stream through moomoo OpenD; markets without a book show a clearly marked simulation).
+- **Time and sales** (`AAPL TAS`, `BTCUSD CRNCY TAS`, ⌘⇧T) — every print, newest first, coloured
+  by the side that crossed the spread (green: buyer lifted the offer, red: seller hit the bid, grey:
+  neutral, e.g. a midpoint cross), with sub-penny prices kept, trade conditions (`EXT`, `ODD`,
+  `OTC`, opening/closing prints), a trade-value filter (all, $10K+, $100K+, $1M+), large and block
+  prints highlighted, and running buy-minus-sell volume and buy share since the pane opened. US
+  stocks and ETFs come from [moomoo OpenD](#moomoo-setup-us-stock-time-and-sales-and-depth),
+  crypto from the Binance aggregate trade stream (Coinbase matches fallback). The tape starts with
+  the latest prints and keeps the newest 5,000.
 - **Market data behind a trait** (`tr_data::MarketData`), routed per asset class to free sources:
 
   | Asset class | History | Quotes | Live |
@@ -84,6 +92,10 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   | US Treasuries | Treasury.gov daily par yield curve CSV (FRED fallback); Yahoo `^IRX/^FVX/^TNX/^TYX` intraday | Treasury.gov | — |
   | FX, indices, futures | Yahoo Finance (`EURUSD=X`, `^GSPC`, `CL=F`) | Yahoo spark (batched) | — |
   | Stocks, ETFs | Alpaca when `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY` are set, else Yahoo | Yahoo spark | — |
+
+  Time and sales and streaming books: moomoo OpenD for US stocks and ETFs (needs a moomoo account;
+  see [moomoo setup](#moomoo-setup-us-stock-time-and-sales-and-depth)); Binance aggregate trades
+  (Coinbase matches fallback) for crypto, whose book is polled every second.
 
   No keys are required. `TR_PROVIDER=sample` runs fully offline on deterministic, class-aware sample
   data (BTCUSD near 65,000, EURUSD near 1.09, US10Y near 4.2%) **with simulated live ticks**, and
@@ -198,6 +210,33 @@ for Updates… or `UPDATE` checks at once. `scripts/check-macos-cross.sh` compil
 and lints the whole workspace for aarch64-apple-darwin from Linux (zig as the C cross-compiler;
 linking needs the macOS SDK).
 
+## moomoo setup (US stock time and sales and depth)
+
+US stock and ETF prints and order books stream from **moomoo OpenD**, the gateway behind moomoo's
+OpenAPI, logged in with your own moomoo account. terminal-rs connects to it directly; nothing is
+shared or redistributed.
+
+1. Download **OpenD** from [moomoo's OpenAPI page](https://www.moomoo.com/download/OpenAPI) and log
+   in with your moomoo account. Leave the API port at its default, **11111**, and leave API
+   connection encryption off (terminal-rs talks to OpenD unencrypted on your machine).
+2. Open `AAPL TAS` (time and sales) or `AAPL OB` (depth). The pane shows **● LIVE** once OpenD
+   pushes data. If OpenD isn't running, the pane says so and keeps retrying, and the order book
+   shows a flagged simulation meanwhile.
+
+Depth and tick-by-tick data follow your account's US quote right; at the time of writing moomoo
+lists US LV3 (Nasdaq TotalView and NYSE ArcaBook) as free during a promotion. Each open time and
+sales or depth pane uses one of the account's quote subscriptions (100 on smaller accounts), and
+closing the pane releases it. `MOOMOO_OPEND=host:port` points at OpenD elsewhere;
+`MOOMOO_OPEND=off` turns the source off.
+
+**How it works.** Each streaming pane opens its own TCP connection to OpenD, sends `InitConnect`,
+subscribes to the ticker or order book with pushes registered, fetches a snapshot so the pane fills
+at once (the latest 500 prints, or the book), then forwards pushes and sends keep-alives at the
+interval OpenD asks for. Messages are protobuf bodies behind OpenD's 44-byte header (protocol id,
+serial number, body length and a SHA-1 of the body); the few messages used are written out in
+`crates/data/src/moomoo/proto.rs` from the `.proto` files in moomoo's Apache-2.0 SDK. The worker
+publishes prints and books to the UI at most ten times a second.
+
 ## Brokerage setup (SnapTrade)
 
 Everything happens in **Settings › Brokerage**, with no commands needed. Open it from the sidebar
@@ -289,7 +328,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | F1 · F2 · F3 · F4 · F5 · F6 · F12 | help · Congress feed · politicians · alerts · watchlist · refresh filings · frame timing |
 | F7 · F8 · F9 | brokerage portfolio · positions · orders |
 | Tab · ⇧Tab | next · previous pane |
-| ⌘1 … ⌘0 · ⌘⇧O | new chart, watchlist, news, order book, world markets, yield curve, Congress, politicians, alerts, search pane · options chain |
+| ⌘1 … ⌘0 · ⌘⇧O · ⌘⇧T | new chart, watchlist, news, order book, world markets, yield curve, Congress, politicians, alerts, search pane · options chain · time and sales |
 | ⌘D · ⌘⇧D · ⌘T · ⌘W · ⌘⇧P | split right · split down · new tab · close pane · pop out |
 | ⌘S · ⌥1 … ⌥9 | save layout · switch to saved layout 1–9 |
 | ⌃⌘S (Ctrl+Shift+S) · ⌘⌥S | toggle sidebar · move sidebar to the other side |
@@ -305,7 +344,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `5` `1H` `D` `1W` `1M` · `YTD` `5Y` `ALL` | interval · quick range |
 | `RSI` `MACD` `SMA 200` `BB 20 2.5` · `IND` `IND VOLUME` · `CLEAR` | toggle any of the 151 indicators (optional parameters) · indicator picker · remove all |
 | `CMP MSFT` · `LOG` · `CANDLE` `BAR` `LINE` `AREA` | compare · log scale · chart type |
-| `AAPL OMON` · `AAPL CN` · `BTCUSD CRNCY OB` · `WEI` · `GC` · `SECF <query>` | options · news · order book · world markets · yield curve · search |
+| `AAPL OMON` · `AAPL CN` · `BTCUSD CRNCY OB` · `AAPL TAS` · `WEI` · `GC` · `SECF <query>` | options · news · order book · time and sales · world markets · yield curve · search |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
 | `NEW BOOK` · `SPLIT DOWN NEWS` · `POP` · `LINK GREEN` · `TITLE Desk` · `CLOSE` | add, split, pop out, link, rename, close panes |
 | `LAYOUT 4` · `LAYOUT SAVE Macro` · `LAYOUT Macro` · `LAYOUT RENAME Rates` · `LAYOUT DUP` · `LAYOUT DEL` · `LAYOUT EXPORT` | grid preset · saved layouts |
@@ -330,7 +369,8 @@ app/            eframe shell: command line, docked panes, chart widget, panels
 crates/core     Bar/Series, timeframes, market keys + security catalog, indicators and their
                 registry (codes, parameters, panes, levels), sample data
 crates/data     MarketData trait; per-class router (Binance/Coinbase, Treasury.gov/FRED, Yahoo,
-                Alpaca), websocket live feeds, sample provider with simulated ticks; bar cache
+                Alpaca), websocket live feeds, moomoo OpenD client (time and sales, depth), sample
+                provider with simulated ticks and prints; bar cache
 crates/chart    wgpu renderer, LOD pyramids, viewport math, axes, drawings, egui paint callback
 crates/congress Senate eFD + House Clerk parsers, rosters, SQLite store, refresh, alerts, performance
 crates/broker   SnapTrade client (request signing, accounts, balances, positions, orders, activity),
@@ -395,9 +435,13 @@ cargo bench -p tr-core && cargo bench -p tr-chart
   a scanned paper filing, Senate search JSON (electronic, paper and amended reports) and PTR tables.
   An end-to-end refresh test covers discovery, roster joins, idempotency and alerts.
 - Data-source parsers are tested against captured responses: Binance klines/24h ticker/websocket
-  kline frames, Coinbase candles/stats/websocket ticker, Treasury.gov curve CSV, FRED CSV, Yahoo
+  kline and aggregate trade frames, Coinbase candles/stats/websocket ticker and match, Treasury.gov curve CSV, FRED CSV, Yahoo
   chart/spark/search. Market-key parsing, catalog search and symbol mapping per source are unit
   tested; opt-in live tests hit the real sources for every asset class.
+- moomoo OpenD: frames are checked byte for byte against the SDK's header layout, and the tape and
+  depth feeds run against a local mock OpenD speaking the real wire format (handshake, subscription,
+  snapshot, pushes that overlap the snapshot, pushes for other securities, a refused subscription,
+  OpenD not running, and the connection closing when the pane does).
 - Indicators are checked against reference values (Wilder's RSI example, hand-computed EMA, MACD,
   population-SD Bollinger, session VWAP) and hand-computed windows (stochastic, %R, CCI, WMA,
   true range, Donchian, envelopes, %B, OBV and A/D, CMF, Aroon, pivots). Every catalogue entry
