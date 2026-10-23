@@ -1,15 +1,16 @@
 //! Time and sales (`TAS`): prints newest first, coloured by the side that crossed the spread,
 //! with a trade-value filter, large-print highlighting and running buy/sell volume.
 
-use std::time::Duration;
-
 use egui::{Align2, Color32, RichText, ScrollArea, Sense, Ui, pos2, vec2};
 use tr_data::{Aggressor, Print};
 
 use super::TapePane;
-use crate::congress_view::Action;
 use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
 use crate::widgets;
+
+/// How to point a pane at another security.
+pub(super) const SWITCH_HINT: &str =
+    "To show another security here, click this pane, type a ticker (e.g. NVDA) and press Enter. Linked panes follow.";
 
 /// Trade-value filters: label and the smallest notional shown.
 const FILTERS: [(&str, f64); 4] = [("All", 0.0), ("$10K+", 1e4), ("$100K+", 1e5), ("$1M+", 1e6)];
@@ -17,16 +18,10 @@ const FILTERS: [(&str, f64); 4] = [("All", 0.0), ("$10K+", 1e4), ("$100K+", 1e5)
 const LARGE: f64 = 1e5;
 const BLOCK: f64 = 1e6;
 
-pub(super) fn tape(ui: &mut Ui, t: &mut TapePane) -> Option<Action> {
-    let mut action = None;
+pub(super) fn tape(ui: &mut Ui, t: &mut TapePane) {
     let key = tr_data::security(&t.symbol);
-    let live = t.status.is_none() && t.last_print.is_some_and(|x| x.elapsed() < Duration::from_secs(10));
     ui.horizontal_wrapped(|ui| {
-        let r = ui.label(RichText::new(&key.ticker).font(mono(13.0)).color(amber())).interact(Sense::click());
-        if r.clicked() {
-            action = Some(Action::OpenChart(t.symbol.clone()));
-        }
-        r.on_hover_text("Open chart");
+        ui.label(RichText::new(&key.ticker).font(mono(13.0)).color(amber())).on_hover_text(SWITCH_HINT);
         if let Some((source, simulated)) = &t.source {
             ui.label(RichText::new(source).font(ui_font(11.5)).color(muted()));
             if *simulated {
@@ -34,8 +29,9 @@ pub(super) fn tape(ui: &mut Ui, t: &mut TapePane) -> Option<Action> {
                     RichText::new(" SIMULATED ").font(ui_font(10.5)).color(Color32::BLACK).background_color(amber()),
                 )
                 .on_hover_text("Offline sample mode: prints are synthetic.");
-            } else if live {
-                ui.label(RichText::new("● LIVE").font(ui_font(10.5)).color(theme::up()));
+            } else if t.connected {
+                ui.label(RichText::new("● LIVE").font(ui_font(10.5)).color(theme::up()))
+                    .on_hover_text("Subscribed: prints appear as they happen.");
             }
         }
     });
@@ -70,10 +66,13 @@ pub(super) fn tape(ui: &mut Ui, t: &mut TapePane) -> Option<Action> {
         if t.status.is_none() {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new());
-                ui.label(RichText::new("Waiting for prints…").font(ui_font(12.0)).color(muted()));
+                let wait =
+                    if t.connected { "No prints yet; waiting for the next trade…" } else { "Waiting for prints…" };
+                ui.label(RichText::new(wait).font(ui_font(12.0)).color(muted()));
             });
         }
-        return action;
+        ui.label(RichText::new(SWITCH_HINT).font(ui_font(11.0)).color(muted()));
+        return;
     }
 
     let rows: Vec<usize> =
@@ -94,7 +93,7 @@ pub(super) fn tape(ui: &mut Ui, t: &mut TapePane) -> Option<Action> {
     }
     if rows.is_empty() {
         ui.label(RichText::new("No prints at this size yet.").font(ui_font(12.0)).color(muted()));
-        return action;
+        return;
     }
     ui.spacing_mut().item_spacing.y = 0.0;
     ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row, rows.len(), |ui, range| {
@@ -133,7 +132,6 @@ pub(super) fn tape(ui: &mut Ui, t: &mut TapePane) -> Option<Action> {
             }
         }
     });
-    action
 }
 
 /// Column anchors (offsets from the left edge) for a pane `w` wide: time is left-aligned,
@@ -198,10 +196,15 @@ fn qty(q: f64) -> String {
     } else if q >= 100.0 {
         format!("{q:.2}")
     } else if q >= 1.0 {
-        format!("{q:.4}")
+        trim(format!("{q:.4}"))
     } else {
-        format!("{q:.5}")
+        trim(format!("{q:.5}"))
     }
+}
+
+/// Drop trailing zeros from a decimal (`0.32000` → `0.32`).
+fn trim(s: String) -> String {
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// Running totals: 1.25M, 12.4K, or small fractional amounts.
@@ -232,7 +235,9 @@ mod tests {
         assert_eq!(qty(100.0), "100");
         assert_eq!(qty(2_500_000.0), "2.50M");
         assert_eq!(qty(0.00089), "0.00089");
-        assert_eq!(qty(1.5), "1.5000");
+        assert_eq!(qty(1.5), "1.5");
+        assert_eq!(qty(0.32), "0.32");
+        assert_eq!(qty(0.86004), "0.86004");
         assert_eq!(compact(12_400.0), "12.4K");
         assert_eq!(compact(0.0), "0");
         assert_eq!(compact(0.0312), "0.0312");

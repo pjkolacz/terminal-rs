@@ -1072,6 +1072,12 @@ impl ChartState {
         ui.checkbox(&mut self.magnet, "Magnet");
         ui.checkbox(&mut self.show_volume, "Volume");
         ui.separator();
+        for (label, code) in [("Time & Sales", "TAS"), ("Order Book", "OB")] {
+            if ui.button(label).clicked() {
+                self.actions.push(Action::Command(format!("{} {code}", self.symbol)));
+                ui.close();
+            }
+        }
         if ui.button("Add to Watchlist").clicked() {
             self.actions.push(Action::AddToWatchlist(self.symbol.clone()));
             ui.close();

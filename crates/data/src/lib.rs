@@ -175,6 +175,8 @@ impl Print {
 pub enum TapeEvent {
     /// New prints, oldest first.
     Prints { prints: Vec<Print>, source: String, simulated: bool },
+    /// Subscribed and streaming. Quiet markets may then send nothing for a long time.
+    Connected,
     /// Connection state worth showing (connecting, source unavailable, retrying).
     Status(String),
 }
@@ -184,6 +186,8 @@ pub enum TapeEvent {
 pub enum DepthEvent {
     /// A full snapshot of the top levels.
     Book(OrderBook),
+    /// Subscribed and streaming; the book is pushed when it changes.
+    Connected,
     Status(String),
 }
 

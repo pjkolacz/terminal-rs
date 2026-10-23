@@ -240,11 +240,18 @@ pub enum Response {
         source: String,
         simulated: bool,
     },
-    /// Connection state of a pane's stream (connecting, unavailable, retrying).
+    /// Connection state of a pane's stream: a problem or progress to show (connecting,
+    /// unavailable, retrying), or `None` once it is subscribed and streaming.
     StreamStatus {
         pane: PaneId,
         symbol: String,
-        status: String,
+        status: Option<String>,
+    },
+    /// Whether an order book pane's market streams its book (otherwise the pane polls).
+    DepthStream {
+        pane: PaneId,
+        symbol: String,
+        streaming: bool,
     },
     History {
         pane: PaneId,
@@ -822,14 +829,15 @@ fn streams(s: &Arc<Shared>, req: Request) -> Option<Request> {
                 let status = format!(
                     "No time and sales source for {key}. Prints stream for US stocks and ETFs through moomoo OpenD, and for crypto."
                 );
-                s.send(Response::StreamStatus { pane, symbol, status });
+                s.send(Response::StreamStatus { pane, symbol, status: Some(status) });
             }
         },
         Request::Depth { pane, symbol, depth } => {
             let h = s
                 .provider
                 .depth(&symbol, depth)
-                .map(|feed| tokio::spawn(forward_depth(s.clone(), pane, symbol, feed)).abort_handle());
+                .map(|feed| tokio::spawn(forward_depth(s.clone(), pane, symbol.clone(), feed)).abort_handle());
+            s.send(Response::DepthStream { pane, symbol, streaming: h.is_some() });
             set_stream(s, pane, h);
         }
         other => return Some(other),
@@ -872,7 +880,10 @@ async fn forward_tape(s: Arc<Shared>, pane: PaneId, symbol: String, mut feed: Ta
                     batch.extend(prints);
                     (source, simulated) = (src, sim);
                 }
-                Some(TapeEvent::Status(status)) => s.send(Response::StreamStatus { pane, symbol: symbol.clone(), status }),
+                Some(TapeEvent::Connected) => s.send(Response::StreamStatus { pane, symbol: symbol.clone(), status: None }),
+                Some(TapeEvent::Status(status)) => {
+                    s.send(Response::StreamStatus { pane, symbol: symbol.clone(), status: Some(status) })
+                }
                 None => break,
             },
             _ = tick.tick(), if !batch.is_empty() => {
@@ -892,7 +903,10 @@ async fn forward_depth(s: Arc<Shared>, pane: PaneId, symbol: String, mut feed: D
         tokio::select! {
             ev = feed.recv() => match ev {
                 Some(DepthEvent::Book(b)) => latest = Some(b),
-                Some(DepthEvent::Status(status)) => s.send(Response::StreamStatus { pane, symbol: symbol.clone(), status }),
+                Some(DepthEvent::Connected) => s.send(Response::StreamStatus { pane, symbol: symbol.clone(), status: None }),
+                Some(DepthEvent::Status(status)) => {
+                    s.send(Response::StreamStatus { pane, symbol: symbol.clone(), status: Some(status) })
+                }
                 None => break,
             },
             _ = tick.tick(), if latest.is_some() => {
@@ -1121,6 +1135,29 @@ mod tests {
         assert!(stopped(second).await, "forgotten pane's stream stopped");
         assert!(streams(&s, Request::Alerts).is_some());
         drop(rx);
+    }
+
+    #[tokio::test]
+    async fn depth_requests_say_whether_the_market_streams() {
+        let (out, rx) = mpsc::channel();
+        let s = Arc::new(Shared {
+            provider: Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
+            series: Default::default(),
+            streams: Default::default(),
+            cache: std::sync::Mutex::new(None),
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            out,
+            ctx: egui::Context::default(),
+        });
+        // No book stream offline, so the pane is told to poll and no stream is kept.
+        assert!(streams(&s, Request::Depth { pane: 3, symbol: "AAPL US Equity".into(), depth: 20 }).is_none());
+        match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            Response::DepthStream { pane, symbol, streaming } => {
+                assert_eq!((pane, symbol.as_str(), streaming), (3, "AAPL US Equity", false));
+            }
+            _ => panic!("expected DepthStream"),
+        }
+        assert!(s.streams.lock().unwrap().is_empty());
     }
 
     #[test]

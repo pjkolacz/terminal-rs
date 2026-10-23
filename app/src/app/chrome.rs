@@ -593,6 +593,12 @@ impl TerminalApp {
                         out.push(SidebarCmd::Action(Action::OpenChart(key.clone())));
                         ui.close();
                     }
+                    for (label, code) in [("Time & Sales", "TAS"), ("Order Book", "OB")] {
+                        if ui.button(label).clicked() {
+                            out.push(SidebarCmd::Action(Action::Command(format!("{key} {code}"))));
+                            ui.close();
+                        }
+                    }
                     if sec.has_congress_trades() && ui.button("Who in Congress Traded This").clicked() {
                         out.push(SidebarCmd::Action(Action::OpenTicker(sec.ticker.clone())));
                         ui.close();
@@ -625,6 +631,20 @@ impl TerminalApp {
                     "OMON",
                     Function::Options,
                     PaneKind::Options(Box::new(super::OptionsPane::new("", 0, true))),
+                ),
+                (
+                    Icon::List,
+                    "Time & Sales",
+                    "TAS",
+                    Function::Tape,
+                    PaneKind::Tape(Box::new(super::TapePane::new("", 0.0))),
+                ),
+                (
+                    Icon::Grid,
+                    "Order Book",
+                    "OB",
+                    Function::OrderBook(None),
+                    PaneKind::OrderBook(Box::new(super::BookPane::new("", 0, 0.0))),
                 ),
                 (
                     Icon::Search,

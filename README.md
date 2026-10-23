@@ -219,9 +219,16 @@ shared or redistributed.
 1. Download **OpenD** from [moomoo's OpenAPI page](https://www.moomoo.com/download/OpenAPI) and log
    in with your moomoo account. Leave the API port at its default, **11111**, and leave API
    connection encryption off (terminal-rs talks to OpenD unencrypted on your machine).
-2. Open `AAPL TAS` (time and sales) or `AAPL OB` (depth). The pane shows **● LIVE** once OpenD
-   pushes data. If OpenD isn't running, the pane says so and keeps retrying, and the order book
-   shows a flagged simulation meanwhile.
+2. Open `AAPL TAS` (time and sales) or `AAPL OB` (depth). The pane shows **● LIVE** once it is
+   subscribed; moomoo pushes prints and book changes as they happen, so a quiet stock can sit
+   still while live. If OpenD isn't running or moomoo refuses the request, the pane says why and
+   keeps retrying.
+
+**Choosing what you see.** Open the panes from the sidebar (Markets › **Time & Sales** /
+**Order Book**), any pane's **+** menu, right-click on a watchlist row or chart, or the command
+line (`NVDA TAS`, `NVDA OB 50`). To change a pane's security, click the pane, type a ticker and
+press Enter. Panes sharing a link colour (`LINK BLUE`, or the tab menu) always show the same
+security, so a chart, its tape and its book move together.
 
 Depth and tick-by-tick data follow your account's US quote right; at the time of writing moomoo
 lists US LV3 (Nasdaq TotalView and NYSE ArcaBook) as free during a promotion. Each open time and

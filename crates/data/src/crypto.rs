@@ -473,6 +473,9 @@ async fn trades_ws(
     if let Some(sub) = subscribe {
         ws.send(Message::Text(sub.into())).await?;
     }
+    if tx.send(TapeEvent::Connected).await.is_err() {
+        return Ok(());
+    }
     while let Some(msg) = ws.next().await {
         match msg? {
             Message::Text(t) => {

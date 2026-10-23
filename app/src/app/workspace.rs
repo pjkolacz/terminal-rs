@@ -20,11 +20,12 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 14] = [
+pub const PANELS: [(&str, &str); 15] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
     ("Order Book", "BOOK"),
+    ("Time & Sales", "TAS"),
     ("Options", "OMON"),
     ("Portfolio", "PORT"),
     ("World Markets", "WEI"),
@@ -610,6 +611,14 @@ impl TerminalApp {
         };
         self.focus = id;
         self.last_opened = Some(id);
+        // A reused pane keeps its link colour; its group follows the new security so linked
+        // panes never disagree (e.g. `TSLA TAS` in a blue group moves the blue chart too).
+        if let Some(i) = self.idx(id)
+            && let (Some(link), Some(sym)) = (self.panes[i].link, self.panes[i].kind.symbol().map(str::to_string))
+            && !sym.is_empty()
+        {
+            self.broadcast(link, &sym, Some(id));
+        }
     }
 
     /// The chart commands act on: the focused one, a visible one, any (revealed), or a new
@@ -675,10 +684,10 @@ impl TerminalApp {
             "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
             "NEWS" | "N" | "CN" | "TOP" => PaneKind::News(Box::new(NewsPane::new(current))),
             "BOOK" | "OB" | "DEPTH" | "DOM" => {
-                // Default to a market with a public book.
-                let sym = given
-                    .or(current.filter(|s| tr_data::security(s).class == tr_core::AssetClass::Crypto))
-                    .unwrap_or_else(|| "BTCUSD Curncy".into());
+                // Default to a market with a book source (crypto, or US stocks via moomoo).
+                use tr_core::AssetClass as C;
+                let has_book = |s: &String| matches!(tr_data::security(s).class, C::Crypto | C::Equity | C::Etf);
+                let sym = given.or(current.filter(has_book)).unwrap_or_else(|| "BTCUSD Curncy".into());
                 PaneKind::OrderBook(Box::new(BookPane::new(&sym, d.book_depth, 0.0)))
             }
             "TAS" | "T&S" | "TAPE" | "QR" => {

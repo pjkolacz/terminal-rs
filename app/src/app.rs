@@ -158,10 +158,14 @@ pub struct BookPane {
     pub error: Option<String>,
     pub fetched: Option<Instant>,
     /// The (symbol, depth) a stream was requested for.
-    pub streaming: Option<(String, usize)>,
-    /// When the stream last pushed a book; polling stands in while it is quiet.
-    pub live_at: Option<Instant>,
-    /// The stream's connection state, while it is not delivering.
+    pub requested: Option<(String, usize)>,
+    /// Whether this market streams its book (`None` until the worker says). Markets that
+    /// don't are polled every second.
+    pub streams: Option<bool>,
+    /// The stream is subscribed. Books are pushed when they change, so a quiet book is
+    /// still live.
+    pub connected: bool,
+    /// The stream's connection problem or progress, while it isn't connected.
     pub status: Option<String>,
 }
 
@@ -174,15 +178,16 @@ impl BookPane {
             book: None,
             error: None,
             fetched: None,
-            streaming: None,
-            live_at: None,
+            requested: None,
+            streams: None,
+            connected: false,
             status: None,
         }
     }
 
-    /// The stream pushed a book recently.
+    /// Streaming and subscribed.
     pub fn is_live(&self) -> bool {
-        self.live_at.is_some_and(|t| t.elapsed() < Duration::from_secs(3))
+        self.streams == Some(true) && self.connected
     }
 }
 
@@ -197,8 +202,10 @@ pub struct TapePane {
     pub min_notional: f64,
     /// Source name and whether it is simulated, once prints arrive.
     pub source: Option<(String, bool)>,
-    /// The stream's connection state.
+    /// The stream's connection problem or progress, while it isn't connected.
     pub status: Option<String>,
+    /// Subscribed and streaming (a quiet stock may still print nothing for a while).
+    pub connected: bool,
     pub requested: bool,
     pub last_print: Option<Instant>,
     /// Volume by aggressor since the pane opened.
@@ -216,6 +223,7 @@ impl TapePane {
             min_notional,
             source: None,
             status: None,
+            connected: false,
             requested: false,
             last_print: None,
             buy_volume: 0.0,
@@ -1140,8 +1148,8 @@ impl TerminalApp {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
                         && let PaneKind::OrderBook(b) = &mut p.kind
                         && b.symbol == symbol
-                        // A poll answered after the stream took over is older than its books.
-                        && (live || !b.is_live())
+                        // Polls only stand in for markets without a stream.
+                        && (live || b.streams != Some(true))
                     {
                         match book {
                             Ok(book) => {
@@ -1151,7 +1159,7 @@ impl TerminalApp {
                             Err(e) => b.error = Some(e),
                         }
                         if live {
-                            b.live_at = Some(Instant::now());
+                            b.connected = true;
                             b.status = None;
                         }
                     }
@@ -1163,15 +1171,32 @@ impl TerminalApp {
                     {
                         t.push(prints);
                         t.source = Some((source, simulated));
-                        t.status = None;
                     }
                 }
                 Response::StreamStatus { pane, symbol, status } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane) {
                         match &mut p.kind {
-                            PaneKind::Tape(t) if t.symbol == symbol => t.status = Some(status),
-                            PaneKind::OrderBook(b) if b.symbol == symbol => b.status = Some(status),
+                            PaneKind::Tape(t) if t.symbol == symbol => {
+                                t.connected = status.is_none();
+                                t.status = status;
+                            }
+                            PaneKind::OrderBook(b) if b.symbol == symbol => {
+                                b.connected = status.is_none();
+                                b.status = status;
+                            }
                             _ => {}
+                        }
+                    }
+                }
+                Response::DepthStream { pane, symbol, streaming } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::OrderBook(b) = &mut p.kind
+                        && b.symbol == symbol
+                    {
+                        b.streams = Some(streaming);
+                        if streaming {
+                            // Drop any polled placeholder; the stream fills the pane.
+                            b.book = b.book.take().filter(|bk| !bk.simulated);
                         }
                     }
                 }
@@ -1480,7 +1505,7 @@ impl TerminalApp {
             }
         }
         // News every 5 minutes; order books stream where the source pushes them and are
-        // polled every second (while visible) whenever the stream is quiet.
+        // polled every second (while visible) where it doesn't.
         for &i in &visible {
             let p = &mut self.panes[i];
             match &mut p.kind {
@@ -1498,11 +1523,13 @@ impl TerminalApp {
                 }
                 PaneKind::OrderBook(b) => {
                     let key = (b.symbol.clone(), b.depth);
-                    if b.streaming.as_ref() != Some(&key) {
+                    if b.requested.as_ref() != Some(&key) {
                         self.worker.send(Request::Depth { pane: p.id, symbol: key.0.clone(), depth: key.1 });
-                        b.streaming = Some(key);
+                        b.requested = Some(key);
+                        b.streams = None;
+                        b.connected = false;
                     }
-                    if !b.is_live() && b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) {
+                    if b.streams == Some(false) && b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) {
                         b.fetched = Some(Instant::now());
                         self.worker.send(Request::OrderBook { pane: p.id, symbol: b.symbol.clone(), depth: b.depth });
                     }

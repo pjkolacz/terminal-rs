@@ -75,16 +75,8 @@ impl TerminalApp {
                     o.fetched = None;
                 }
             }
-            PaneKind::OrderBook(b) => {
-                if let Some(a) = order_book(ui, b) {
-                    actions.push(a);
-                }
-            }
-            PaneKind::Tape(t) => {
-                if let Some(a) = super::tape_view::tape(ui, t) {
-                    actions.push(a);
-                }
-            }
+            PaneKind::OrderBook(b) => order_book(ui, b),
+            PaneKind::Tape(t) => super::tape_view::tape(ui, t),
             PaneKind::Portfolio(pp) => {
                 let demo =
                     (self.prefs.trading.account_mode == crate::prefs::AccountMode::Demo).then_some(&*self.demo.pf);
@@ -215,6 +207,12 @@ impl TerminalApp {
                         out.push(Action::OpenChart(s.clone()));
                         ui.close();
                     }
+                    for (label, code) in [("Time & Sales", "TAS"), ("Order Book", "OB")] {
+                        if ui.button(label).clicked() {
+                            out.push(Action::Command(format!("{s} {code}")));
+                            ui.close();
+                        }
+                    }
                     if sec.has_congress_trades() && ui.button("Who in Congress Traded This").clicked() {
                         out.push(Action::OpenTicker(sec.ticker.clone()));
                         ui.close();
@@ -321,6 +319,21 @@ pub fn group_steps(mid: f64) -> [f64; 4] {
     [0.0, base, base * 10.0, base * 100.0]
 }
 
+/// Bucket sizes for a book: US stocks trade in cents, so they group by 1¢, 10¢ and $1
+/// whatever the price; everything else scales with the price.
+fn book_steps(mid: f64, class: tr_core::AssetClass) -> [f64; 4] {
+    let steps = group_steps(mid);
+    match class {
+        tr_core::AssetClass::Equity | tr_core::AssetClass::Etf if steps[1] < 0.01 => [0.0, 0.01, 0.1, 1.0],
+        _ => steps,
+    }
+}
+
+/// Decimals that show a bucket size exactly (0.01 → 2, 10 → 0).
+fn step_decimals(step: f64) -> usize {
+    (-step.log10()).ceil().clamp(0.0, 8.0) as usize
+}
+
 fn fmt_size(q: f64) -> String {
     if q >= 1e6 {
         format!("{:.2}M", q / 1e6)
@@ -337,28 +350,22 @@ fn fmt_size(q: f64) -> String {
 }
 
 /// Price ladder: asks above, bids below, depth bars by cumulative size.
-fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
-    let mut action = None;
+fn order_book(ui: &mut Ui, b: &mut super::BookPane) {
     let key = tr_data::security(&b.symbol);
     let book: Option<OrderBook> = b.book.as_ref().map(|x| x.grouped(b.group));
     ui.horizontal_wrapped(|ui| {
-        let r = ui.label(RichText::new(&key.ticker).font(mono(13.0)).color(amber())).interact(Sense::click());
-        if r.clicked() {
-            action = Some(Action::OpenChart(b.symbol.clone()));
-        }
-        r.on_hover_text("Open chart");
+        ui.label(RichText::new(&key.ticker).font(mono(13.0)).color(amber()))
+            .on_hover_text(super::tape_view::SWITCH_HINT);
         if let Some(bk) = &book {
             ui.label(RichText::new(&bk.source).font(ui_font(11.5)).color(muted()));
             if bk.simulated {
                 ui.label(
                     RichText::new(" SIMULATED ").font(ui_font(10.5)).color(Color32::BLACK).background_color(amber()),
                 )
-                .on_hover_text(
-                    "No live book for this market (or offline); levels are synthetic. US stocks stream through moomoo OpenD.",
-                );
+                .on_hover_text("No book source for this market (or offline); levels are synthetic.");
             } else if b.is_live() {
                 ui.label(RichText::new("● LIVE").font(ui_font(10.5)).color(theme::up()))
-                    .on_hover_text("Streaming: the book updates as the source pushes it.");
+                    .on_hover_text("Subscribed: the book updates whenever it changes.");
             }
         }
     });
@@ -375,10 +382,11 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
             b.fetched = None;
         }
         let mid = b.book.as_ref().and_then(OrderBook::mid).unwrap_or(1.0);
-        let steps = group_steps(mid);
-        let d = key.decimals(mid);
-        let labels: Vec<String> =
-            steps.iter().map(|s| if *s == 0.0 { "Raw".into() } else { format!("{:.*}", d.min(8), s) }).collect();
+        let steps = book_steps(mid, key.class);
+        let labels: Vec<String> = steps
+            .iter()
+            .map(|&s| if s == 0.0 { "Raw".into() } else { format!("{:.*}", step_decimals(s), s) })
+            .collect();
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let sel = steps.iter().position(|s| (*s - b.group).abs() < 1e-12);
         if let Some(i) = widgets::segmented(ui, ("book-group", &b.symbol), &refs, sel, 20.0) {
@@ -389,9 +397,16 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
         ui.label(RichText::new(e).font(ui_font(12.0)).color(theme::down()));
     }
     let Some(book) = book else {
-        ui.add(egui::Spinner::new());
-        return action;
+        if b.status.is_none() {
+            ui.add(egui::Spinner::new());
+        }
+        return;
     };
+    if book.bids.is_empty() && book.asks.is_empty() {
+        ui.label(RichText::new("No resting orders on the book right now.").font(ui_font(12.0)).color(muted()));
+        ui.label(RichText::new(super::tape_view::SWITCH_HINT).font(ui_font(11.0)).color(muted()));
+        return;
+    }
     let rect = ui.available_rect_before_wrap();
     let d = key.decimals(book.mid().unwrap_or(1.0));
     let row = dp(18.0);
@@ -459,7 +474,6 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
     }
     ui.allocate_rect(rect, Sense::hover());
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-    action
 }
 
 #[cfg(test)]
@@ -472,6 +486,14 @@ mod tests {
         let fx = group_steps(1.09);
         assert!((fx[1] - 1e-4).abs() < 1e-12);
         assert_eq!(fmt_size(1_500.0), "1.50K");
+        // A $4 stock groups by cents, not hundredths of a cent; labels show each step exactly.
+        use tr_core::AssetClass as C;
+        assert_eq!(book_steps(4.30, C::Equity), [0.0, 0.01, 0.1, 1.0]);
+        assert_eq!(book_steps(348.0, C::Equity), group_steps(348.0));
+        assert_eq!(book_steps(4.30, C::Crypto), group_steps(4.30));
+        let labels: Vec<String> =
+            [0.01, 0.1, 1.0, 10.0, 0.0001].map(|s| format!("{:.*}", step_decimals(s), s)).to_vec();
+        assert_eq!(labels, ["0.01", "0.1", "1", "10", "0.0001"]);
         assert_eq!(fmt_size(0.5), "0.50000");
         assert_eq!(fmt_size(420.0), "420");
         assert_eq!(fmt_size(2.5), "2.500");

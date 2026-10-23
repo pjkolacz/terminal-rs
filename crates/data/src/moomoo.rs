@@ -146,7 +146,7 @@ async fn tape_session(mut conn: Conn, target: &proto::Security, tx: &mpsc::Sende
         )
         .await?;
     let snap = check(snap, "ticker snapshot")?;
-    if !send_prints(tx, &mut seen, &snap.ticker_list).await {
+    if !send_prints(tx, &mut seen, &snap.ticker_list).await || tx.send(TapeEvent::Connected).await.is_err() {
         return Ok(());
     }
     let mut tick = conn.keep_alive_timer().await;
@@ -191,6 +191,9 @@ async fn depth_session(
             }
         }
         Err(e) => tracing::debug!("moomoo order book snapshot: {e:#}"),
+    }
+    if tx.send(DepthEvent::Connected).await.is_err() {
+        return Ok(());
     }
     let mut tick = conn.keep_alive_timer().await;
     while let Some(frame) = conn.next(&mut tick, tx).await? {

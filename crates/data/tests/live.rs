@@ -33,6 +33,7 @@ async fn moomoo_opend_tape_and_depth() {
     let prints = loop {
         match tokio::time::timeout(wait, tape.recv()).await.expect("tape timed out").unwrap() {
             TapeEvent::Prints { prints, .. } => break prints,
+            TapeEvent::Connected => {}
             TapeEvent::Status(s) if s.starts_with("Connecting") => {}
             TapeEvent::Status(s) => panic!("tape: {s}"),
         }
@@ -43,6 +44,7 @@ async fn moomoo_opend_tape_and_depth() {
     let book = loop {
         match tokio::time::timeout(wait, depth.recv()).await.expect("depth timed out").unwrap() {
             DepthEvent::Book(b) => break b,
+            DepthEvent::Connected => {}
             DepthEvent::Status(s) if s.starts_with("Connecting") => {}
             DepthEvent::Status(s) => panic!("depth: {s}"),
         }
@@ -159,6 +161,7 @@ mod markets {
                     assert!(!simulated);
                     got.extend(prints);
                 }
+                tr_data::TapeEvent::Connected => {}
                 tr_data::TapeEvent::Status(s) => eprintln!("status: {s}"),
             }
         }

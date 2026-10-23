@@ -85,6 +85,7 @@ async fn prints(rx: &mut tr_data::TapeFeed) -> Vec<tr_data::Print> {
                 assert_eq!((source.as_str(), simulated), ("moomoo", false));
                 return prints;
             }
+            TapeEvent::Connected => {}
             TapeEvent::Status(s) => assert!(s.contains("Connecting"), "{s}"),
         }
     }
@@ -172,12 +173,15 @@ async fn depth_streams_full_snapshots() {
     write(&mut s, proto::QOT_UPDATE_ORDER_BOOK, 0, &reply(book([182.41, 182.40], [182.42, 182.43, 182.44]))).await;
 
     let mut books = Vec::new();
+    let mut connected = false;
     while books.len() < 2 {
         match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("depth event").unwrap() {
             DepthEvent::Book(b) => books.push(b),
+            DepthEvent::Connected => connected = true,
             DepthEvent::Status(st) => assert!(st.contains("Connecting"), "{st}"),
         }
     }
+    assert!(connected, "the feed says when it is subscribed");
     assert_eq!(books[0].bids, vec![(182.40, 300.0), (182.39, 700.0)]);
     assert_eq!(books[0].asks.len(), 2, "trimmed to the requested depth");
     assert_eq!(books[1].bids[0], (182.41, 300.0));
