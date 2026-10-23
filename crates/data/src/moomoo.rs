@@ -424,7 +424,14 @@ impl Conn {
         let reply: proto::InitConnectResponse =
             tokio::time::timeout(Duration::from_secs(10), conn.call(proto::INIT_CONNECT, &init))
                 .await
-                .map_err(|_| anyhow!("OpenD at {addr} did not answer InitConnect"))??;
+                // OpenD holds the handshake while login is unfinished or the account still owes
+                // moomoo's one-time API questionnaire and agreement (its log links to it).
+                .map_err(|_| {
+                    anyhow!(
+                        "OpenD at {addr} took the connection but didn't finish the handshake; check the OpenD window: \
+                         finish logging in, or complete moomoo's API questionnaire and agreement"
+                    )
+                })??;
         let s2c = check(reply, "InitConnect")?;
         conn.keep_alive = Duration::from_secs(s2c.keep_alive_interval.clamp(3, 60) as u64);
         Ok(conn)

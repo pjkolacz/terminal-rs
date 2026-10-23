@@ -18,6 +18,46 @@ async fn yahoo_history_and_paging() {
     assert_eq!(q.len(), 2);
 }
 
+/// Against a running, logged-in moomoo OpenD (`MOOMOO_OPEND` or 127.0.0.1:11111):
+/// `cargo test -p tr-data --test live moomoo -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "needs moomoo OpenD"]
+async fn moomoo_opend_tape_and_depth() {
+    use std::time::Duration;
+    use tr_data::{DepthEvent, TapeEvent};
+    let m = tr_data::moomoo::Moomoo::from_env().expect("MOOMOO_OPEND is off");
+    let key = "AAPL US Equity";
+    let sec = tr_data::security(key);
+    let wait = Duration::from_secs(30);
+    let mut tape = m.tape(key, &sec).unwrap();
+    let prints = loop {
+        match tokio::time::timeout(wait, tape.recv()).await.expect("tape timed out").unwrap() {
+            TapeEvent::Prints { prints, .. } => break prints,
+            TapeEvent::Status(s) if s.starts_with("Connecting") => {}
+            TapeEvent::Status(s) => panic!("tape: {s}"),
+        }
+    };
+    eprintln!("{} prints; latest {:?}", prints.len(), prints.last());
+    assert!(!prints.is_empty() && prints.iter().all(|p| p.price > 0.0 && p.size > 0.0));
+    let mut depth = m.depth(key, &sec, 10).unwrap();
+    let book = loop {
+        match tokio::time::timeout(wait, depth.recv()).await.expect("depth timed out").unwrap() {
+            DepthEvent::Book(b) => break b,
+            DepthEvent::Status(s) if s.starts_with("Connecting") => {}
+            DepthEvent::Status(s) => panic!("depth: {s}"),
+        }
+    };
+    eprintln!(
+        "{} bids, {} asks; best {:?} / {:?}",
+        book.bids.len(),
+        book.asks.len(),
+        book.bids.first(),
+        book.asks.first()
+    );
+    assert!(!book.bids.is_empty() || !book.asks.is_empty());
+    assert!(book.bids.windows(2).all(|w| w[0].0 > w[1].0) && book.asks.windows(2).all(|w| w[0].0 < w[1].0));
+}
+
 mod markets {
     use std::time::Duration;
     use tr_core::Timeframe;
